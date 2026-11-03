@@ -29,9 +29,10 @@ jobs:
 
       - name: Collect stats
         env:
-          # STATS_TOKEN (a personal access token) unlocks traffic views/clones and private-repo
-          # contributions. Without it the built-in token still collects all public stats.
-          GH_TOKEN: ${{ secrets.STATS_TOKEN || secrets.GITHUB_TOKEN }}
+          # Built-in token: reads all public stats.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional personal access token: adds traffic (views/clones/referrers).
+          STATS_TOKEN: ${{ secrets.STATS_TOKEN }}
         run: node scripts/collect.mjs
 
       - name: Commit data
