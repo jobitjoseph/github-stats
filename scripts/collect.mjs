@@ -61,14 +61,26 @@ async function writeJSON(file, obj, pretty = false) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function gqlOnce(token, query, variables, attempt = 0) {
-  const res = await fetch(`${API}/graphql`, { method: "POST", headers: headersFor(token), body: JSON.stringify({ query, variables }) });
-  if ((res.status === 502 || res.status === 503) && attempt < 4) {
-    await sleep(2000 * (attempt + 1));
-    return gqlOnce(token, query, variables, attempt + 1);
+async function gqlOnce(token, query, variables, retries = 2) {
+  let res, text;
+  try {
+    res = await fetch(`${API}/graphql`, { method: "POST", headers: headersFor(token), body: JSON.stringify({ query, variables }), signal: AbortSignal.timeout(60000) });
+    text = await res.text();
+  } catch (e) {
+    res = { status: 0 }; text = "";
   }
   if (res.status === 401) return { errors: [{ message: "Bad credentials (token invalid or expired)", type: "FORBIDDEN" }] };
-  return res.json();
+  let body = null;
+  try { body = JSON.parse(text); } catch { /* GitHub sends an HTML page on timeouts/outages */ }
+  const transient = !body || res.status >= 500 || res.status === 0 || (res.status === 403 && /rate limit|abuse|secondary/i.test(text));
+  if (transient) {
+    if (retries > 0) {
+      await sleep(res.status === 403 ? 30000 : 3000);
+      return gqlOnce(token, query, variables, retries - 1);
+    }
+    return { errors: [{ message: `GitHub did not answer in time (HTTP ${res.status || "network error"})`, type: "TIMEOUT" }] };
+  }
+  return body;
 }
 
 /**
@@ -227,31 +239,39 @@ const REPO_EXTRA = `
         discussions{totalCount}
         deployments{totalCount}`;
 const repoQ = (fields) => `
-query($login:String!,$after:String,$privacy:RepositoryPrivacy){
+query($login:String!,$first:Int!,$after:String,$privacy:RepositoryPrivacy){
   user(login:$login){
-    repositories(first:50,after:$after,privacy:$privacy,ownerAffiliations:[${EXTRA_OWNERS}],orderBy:{field:STARGAZERS,direction:DESC}){
+    repositories(first:$first,after:$after,privacy:$privacy,ownerAffiliations:[${EXTRA_OWNERS}],orderBy:{field:STARGAZERS,direction:DESC}){
       pageInfo{hasNextPage endCursor}
       nodes{${fields}}
     }
   }
 }`;
 const repos = [];
-let after = null, fields = REPO_CORE + REPO_EXTRA;
-do {
-  const vars = { login: USER, after, privacy: INCLUDE_PRIVATE ? null : "PUBLIC" };
+const isTimeout = (errors) => errors?.some((e) => e.type === "TIMEOUT" || /timeout|timed out|did not answer/i.test(e.message));
+let after = null, fields = REPO_CORE + REPO_EXTRA, first = 20;
+while (true) {
+  const vars = { login: USER, first, after, privacy: INCLUDE_PRIVATE ? null : "PUBLIC" };
   let { data, errors } = await gqlTry(repoQ(fields), vars);
+  // Too slow for GitHub's time limit → ask for fewer repos per page and retry this page
+  if (!data?.user?.repositories && isTimeout(errors) && first > 5) {
+    first = Math.max(5, Math.floor(first / 2));
+    console.warn(`! Repository page timed out; retrying with ${first} per page`);
+    continue;
+  }
   if (!data?.user?.repositories && fields !== REPO_CORE) {
-    console.warn(`! Full repository query refused (${errText(errors || [])}); retrying with core fields`);
+    console.warn(`! Full repository query failed (${errText(errors || [])}); retrying with core fields`);
     fields = REPO_CORE;
-    ({ data, errors } = await gqlTry(repoQ(fields), vars));
+    continue;
   }
   const r = data?.user?.repositories;
   if (!r) die(`Could not list repositories: ${errText(errors || [])}`);
   if (errors?.length) console.warn("! GraphQL warning:", errText(errors));
   repos.push(...r.nodes.filter(Boolean));
-  after = r.pageInfo.hasNextPage ? r.pageInfo.endCursor : null;
   log(`repos: ${repos.length}`);
-} while (after);
+  if (!r.pageInfo.hasNextPage) break;
+  after = r.pageInfo.endCursor;
+}
 
 const kept = repos.filter((r) => !EXCLUDE.has(r.name.toLowerCase()) && !EXCLUDE.has(r.nameWithOwner.toLowerCase()));
 
@@ -276,7 +296,8 @@ const enriched = await pool(kept, 4, async (r) => {
   if (r.stargazerCount > 0) {
     let cur = null, pages = 0;
     do {
-      const d = await gql(starQ, { owner, name, after: cur });
+      const { data: d, errors: se } = await gqlTry(starQ, { owner, name, after: cur });
+      if (se?.length && !d?.repository) console.warn(`! Star timeline for ${name} incomplete: ${errText(se)}`);
       const sg = d?.repository?.stargazers;
       if (!sg) break;
       for (const e of sg.edges) { const day = e.starredAt.slice(0, 10); starDays[day] = (starDays[day] || 0) + 1; }
