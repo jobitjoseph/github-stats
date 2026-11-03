@@ -4,5 +4,6 @@
   "includeOrgRepos": false,
   "excludeRepos": [],
   "trafficForArchived": false,
+  "trafficForForks": false,
   "maxStargazerPagesPerRepo": 50
 }

@@ -323,7 +323,9 @@ const enriched = await pool(kept, 4, async (r) => {
 
   // Traffic (needs push access → a personal access token; silently skipped otherwise)
   let traffic = null;
-  if (!r.isArchived || config.trafficForArchived) {
+  // Archived repos and forks are skipped by default to save API requests (see stats.config.json)
+  const wantTraffic = (!r.isArchived || config.trafficForArchived) && (!r.isFork || config.trafficForForks);
+  if (wantTraffic) {
     const [views, clones, refs, paths] = await Promise.all([
       rest(`/repos/${full}/traffic/views`),
       rest(`/repos/${full}/traffic/clones`),
@@ -428,6 +430,7 @@ const totals = {
 const today = new Date().toISOString().slice(0, 10);
 const stats = {
   generated: new Date().toISOString(),
+  repo: process.env.GITHUB_REPOSITORY || null, // e.g. jobitjoseph/github-stats – used by the dashboard's refresh button
   trafficAvailable,
   profile: {
     login: user.login, name: user.name, avatar: user.avatarUrl, bio: user.bio, company: user.company,

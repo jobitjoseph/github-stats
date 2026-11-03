@@ -62,21 +62,80 @@
   };
 
   // ───────────── load ─────────────
-  async function load() {
-    const get = (u, fb) => fetch(u + "?t=" + Date.now()).then((r) => (r.ok ? r.json() : fb)).catch(() => fb);
+  const getJSON = (u, fb) => fetch(u + "?t=" + Date.now(), { cache: "no-store" }).then((r) => (r.ok ? r.json() : fb)).catch(() => fb);
+  async function fetchAll() {
     const [stats, history, traffic] = await Promise.all([
-      get("data/stats.json", null), get("data/history.json", []), get("data/traffic.json", { repos: {} }),
+      getJSON("data/stats.json", null), getJSON("data/history.json", []), getJSON("data/traffic.json", { repos: {} }),
     ]);
+    return { stats, history, traffic };
+  }
+
+  async function load() {
+    const { stats, history, traffic } = await fetchAll();
+    setupRefresh(stats);
     if (!stats) {
       $("#loading").classList.remove("skeleton");
-      $("#loading").innerHTML = `<div><h2>No data yet</h2><p>Run the <b>Update GitHub stats</b> workflow in the Actions tab once, then reload.</p></div>`;
+      const wf = workflowURL(null);
+      $("#loading").innerHTML = `<div><h2>No data yet</h2><p>Run the <b>Update GitHub stats</b> workflow${wf ? ` (<a href="${esc(wf)}" target="_blank" rel="noopener">open it</a>)` : " in the Actions tab"} once, then reload.</p></div>`;
       return;
     }
     S.stats = stats; S.history = history; S.traffic = traffic;
-    // derived per-repo star total from timeline
     readHash();
     render();
     window.addEventListener("hashchange", readHash);
+  }
+
+  // ───────────── manual refresh ─────────────
+  // A static page can't start a workflow without a token, and putting a token in the page
+  // would make it public. So the button opens the workflow's "Run workflow" page on GitHub
+  // (only people with write access can start it), then watches for the new data to deploy.
+  function dashboardRepo(stats) {
+    if (stats?.repo) return stats.repo;
+    const m = location.hostname.match(/^([^.]+)\.github\.io$/i);
+    if (!m) return null;
+    const seg = location.pathname.split("/").filter(Boolean)[0];
+    return `${m[1]}/${seg && !/\.html?$/.test(seg) ? seg : `${m[1]}.github.io`}`;
+  }
+  function workflowURL(stats) {
+    const repo = dashboardRepo(stats);
+    return repo ? `https://github.com/${repo}/actions/workflows/stats.yml` : null;
+  }
+  let polling = null;
+  function setupRefresh(stats) {
+    const btn = $("#refreshBtn"), url = workflowURL(stats);
+    if (!url) return;
+    btn.href = url;
+    btn.classList.remove("hidden");
+    btn.onclick = () => {
+      if (polling) return;
+      const started = Date.now(), seen = S.stats?.generated || null;
+      btn.classList.add("spinning");
+      btn.title = "Waiting for new data… (click Run workflow on the GitHub page)";
+      toast("Click <b>Run workflow</b> on the GitHub page. This dashboard will update itself when the new data is live.", 9000);
+      polling = setInterval(async () => {
+        const s = await getJSON("data/stats.json", null);
+        if (s && s.generated !== seen) {
+          stopPolling();
+          const all = await fetchAll();
+          if (all.stats) { S.stats = all.stats; S.history = all.history; S.traffic = all.traffic; const y = scrollY; render(); scrollTo(0, y); }
+          toast("Dashboard updated with fresh data.", 5000);
+        } else if (Date.now() - started > 30 * 60 * 1000) {
+          stopPolling();
+          toast("No new data after 30 minutes. Check the workflow run on GitHub, then reload this page.", 8000);
+        }
+      }, 30000);
+    };
+    function stopPolling() {
+      clearInterval(polling); polling = null;
+      btn.classList.remove("spinning");
+      btn.title = "Refresh data (opens GitHub Actions)";
+    }
+  }
+  function toast(html, ms) {
+    let t = $("#toast");
+    if (!t) { t = document.createElement("div"); t.id = "toast"; t.setAttribute("role", "status"); document.body.appendChild(t); }
+    t.innerHTML = html; t.classList.add("show");
+    clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove("show"), ms);
   }
 
   // ───────────── chart helpers ─────────────
@@ -375,7 +434,7 @@
   function trafficHTML() {
     return `
       <section id="traffic">
-        <h2>Traffic <small>accumulated daily — GitHub itself only keeps 14 days</small></h2>
+        <h2>Traffic <small>accumulated on every refresh — GitHub itself only keeps 14 days</small></h2>
         <div class="card">
           <div class="card-head">
             <div><h3>Views &amp; clones</h3><p class="hint">All repositories, per day</p></div>
