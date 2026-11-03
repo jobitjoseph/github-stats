@@ -21,23 +21,33 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DATA = path.join(ROOT, "data");
 
 const config = await readJSON(path.join(ROOT, "stats.config.json"), {});
-const TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+// Two possible tokens:
+//  • GITHUB_TOKEN – built into every Actions run; reads all public data via GraphQL.
+//  • STATS_TOKEN  – your personal access token; needed for traffic (views/clones).
+// Fine-grained personal tokens can't read some user-level GraphQL fields, so GraphQL
+// tries the built-in token first and REST tries the personal token first. Each call
+// falls back to the other token when access is refused.
+const PAT = process.env.STATS_TOKEN || process.env.GH_TOKEN || "";
+const BUILTIN = process.env.GITHUB_TOKEN || "";
+const GQL_TOKENS = [...new Set([BUILTIN, PAT].filter(Boolean))];
+const REST_TOKENS = [...new Set([PAT, BUILTIN].filter(Boolean))];
+const TOKEN = GQL_TOKENS[0];
 const USER = process.env.GH_USER || config.username || process.env.GITHUB_REPOSITORY_OWNER;
 const INCLUDE_PRIVATE = !!config.includePrivate;
 const EXCLUDE = new Set((config.excludeRepos || []).map((s) => s.toLowerCase()));
 const EXTRA_OWNERS = config.includeOrgRepos ? "OWNER, ORGANIZATION_MEMBER, COLLABORATOR" : "OWNER";
 const MAX_STAR_PAGES = config.maxStargazerPagesPerRepo ?? 50; // 100 stars per page
 
-if (!TOKEN) die("No token. Set GH_TOKEN or GITHUB_TOKEN.");
+if (!TOKEN) die("No token. Set GITHUB_TOKEN, STATS_TOKEN or GH_TOKEN.");
 if (!USER) die("No username. Set it in stats.config.json.");
 
-const API = "https://api.github.com";
-const headers = {
-  Authorization: `Bearer ${TOKEN}`,
+const API = process.env.GH_API_URL || "https://api.github.com";
+const headersFor = (token) => ({
+  Authorization: `Bearer ${token}`,
   Accept: "application/vnd.github+json",
   "X-GitHub-Api-Version": "2022-11-28",
   "User-Agent": "github-stats-dashboard",
-};
+});
 
 // ───────────────────────── helpers ─────────────────────────
 function die(msg) { console.error("✖ " + msg); process.exit(1); }
@@ -51,29 +61,67 @@ async function writeJSON(file, obj, pretty = false) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function gql(query, variables = {}, attempt = 0) {
-  const res = await fetch(`${API}/graphql`, { method: "POST", headers, body: JSON.stringify({ query, variables }) });
-  if ((res.status === 502 || res.status === 503 || res.status === 403) && attempt < 4) {
+async function gqlOnce(token, query, variables, attempt = 0) {
+  const res = await fetch(`${API}/graphql`, { method: "POST", headers: headersFor(token), body: JSON.stringify({ query, variables }) });
+  if ((res.status === 502 || res.status === 503) && attempt < 4) {
     await sleep(2000 * (attempt + 1));
-    return gql(query, variables, attempt + 1);
+    return gqlOnce(token, query, variables, attempt + 1);
   }
-  const body = await res.json();
-  if (body.errors) {
-    // Partial data is still useful (e.g. a single inaccessible field)
-    const msg = body.errors.map((e) => e.message).join("; ");
-    if (!body.data) throw new Error("GraphQL: " + msg);
-    console.warn("! GraphQL warning:", msg);
+  if (res.status === 401) return { errors: [{ message: "Bad credentials (token invalid or expired)", type: "FORBIDDEN" }] };
+  return res.json();
+}
+
+/**
+ * GraphQL with token fallback. Returns { data, errors }; never throws for access errors,
+ * so callers can treat a missing section as optional.
+ */
+async function gqlTry(query, variables = {}) {
+  let last = null;
+  for (const token of GQL_TOKENS) {
+    const body = await gqlOnce(token, query, variables);
+    if (!body.errors?.length) return { data: body.data, errors: null };
+    last = body;
+    const denied = body.errors.some((e) => e.type === "FORBIDDEN" || /not accessible|Bad credentials|permission/i.test(e.message));
+    if (!denied) break; // a real error – another token won't help
   }
-  return body.data;
+  return { data: last?.data ?? null, errors: last?.errors ?? [] };
+}
+const errText = (errors) => errors.map((e) => (e.path ? e.path.join(".") + ": " : "") + e.message).join("; ");
+
+/** GraphQL that must succeed. */
+async function gql(query, variables = {}) {
+  const { data, errors } = await gqlTry(query, variables);
+  if (errors?.length) {
+    if (!data) throw new Error("GraphQL: " + errText(errors));
+    console.warn("! GraphQL warning:", errText(errors));
+  }
+  return data;
+}
+
+/** GraphQL for an optional piece of data: returns fallback (and logs) if it can't be read. */
+async function gqlOpt(label, query, variables, pick, fallback) {
+  const { data, errors } = await gqlTry(query, variables);
+  let v; try { v = pick(data); } catch { v = undefined; }
+  if (v == null) { console.warn(`! Skipping ${label}: ${errors?.length ? errText(errors) : "no data"}`); return fallback; }
+  return v;
 }
 
 /** REST GET. Returns null instead of throwing for 403/404 (e.g. traffic without push access). */
-async function rest(p, attempt = 0) {
-  const res = await fetch(p.startsWith("http") ? p : `${API}${p}`, { headers });
-  if (res.status === 202 && attempt < 3) { await sleep(1500); return rest(p, attempt + 1); } // stats being computed
-  if (res.status === 403 || res.status === 404 || res.status === 204) return null;
-  if (!res.ok) { console.warn(`! ${res.status} on ${p}`); return null; }
-  return res.json();
+async function rest(p) {
+  const url = p.startsWith("http") ? p : `${API}${p}`;
+  for (const token of REST_TOKENS) {
+    let res;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      res = await fetch(url, { headers: headersFor(token) });
+      if (res.status !== 202) break;
+      await sleep(1500); // repo statistics are still being computed
+    }
+    if (res.status === 202 || res.status === 204) return null;
+    if (res.status === 401 || res.status === 403 || res.status === 404) continue; // try the other token
+    if (!res.ok) { console.warn(`! ${res.status} on ${p}`); return null; }
+    return res.json();
+  }
+  return null;
 }
 
 async function pool(items, size, fn) {
@@ -87,40 +135,58 @@ async function pool(items, size, fn) {
 
 // ───────────────────────── 1. profile + contributions ─────────────────────────
 log(`Collecting stats for ${USER}`);
-const profileQ = `
-query($login:String!){
-  user(login:$login){
-    login name avatarUrl bio company location websiteUrl twitterUsername url createdAt
-    followers{totalCount} following{totalCount}
-    starredRepositories{totalCount}
-    gists(privacy:PUBLIC){totalCount}
-    organizations(first:30){nodes{login avatarUrl url}}
-    pinnedItems(first:6,types:REPOSITORY){nodes{... on Repository{name}}}
-    repositoriesContributedTo(contributionTypes:[COMMIT,PULL_REQUEST,ISSUE]){totalCount}
-    pullRequests{totalCount}
-    mergedPRs: pullRequests(states:MERGED){totalCount}
-    issues{totalCount}
-    contributionsCollection{
-      contributionYears
-      totalCommitContributions totalIssueContributions totalPullRequestContributions
-      totalPullRequestReviewContributions totalRepositoryContributions restrictedContributionsCount
-      contributionCalendar{ totalContributions weeks{ contributionDays{ date contributionCount weekday } } }
-    }
-  }
-}`;
-const { user } = await gql(profileQ, { login: USER });
-if (!user) die(`User ${USER} not found`);
+log(`Tokens: ${BUILTIN ? "built-in" : ""}${BUILTIN && PAT ? " + " : ""}${PAT ? "personal (STATS_TOKEN)" : ""}`);
+const V = { login: USER };
+const cnt = (x) => x?.totalCount ?? 0;
+const userPart = (fields) => `query($login:String!){user(login:$login){${fields}}}`;
 
-const cc = user.contributionsCollection;
+// Core profile – GraphQL, falling back to the REST profile if GraphQL is refused
+let user = await gqlOpt("profile (GraphQL)",
+  userPart("login name avatarUrl bio company location websiteUrl twitterUsername url createdAt followers{totalCount} following{totalCount}"),
+  V, (d) => d.user, null);
+if (!user) {
+  const u = await rest(`/users/${USER}`);
+  if (!u) die(`Could not read the profile of "${USER}". Check the username in stats.config.json and that the token is valid.`);
+  user = {
+    login: u.login, name: u.name, avatarUrl: u.avatar_url, bio: u.bio, company: u.company, location: u.location,
+    websiteUrl: u.blog, twitterUsername: u.twitter_username, url: u.html_url, createdAt: u.created_at,
+    followers: { totalCount: u.followers }, following: { totalCount: u.following },
+  };
+}
+
+// Optional extras – each read on its own, so one refused field can't break the rest
+const extra = {
+  starred: await gqlOpt("starred repos", userPart("starredRepositories{totalCount}"), V, (d) => d.user.starredRepositories.totalCount, 0),
+  gists: await gqlOpt("gists", userPart("gists(privacy:PUBLIC){totalCount}"), V, (d) => d.user.gists.totalCount, 0),
+  orgs: await gqlOpt("organizations", userPart("organizations(first:30){nodes{login avatarUrl url}}"), V, (d) => d.user.organizations.nodes, null),
+  pinned: await gqlOpt("pinned repos", userPart("pinnedItems(first:6,types:REPOSITORY){nodes{... on Repository{name}}}"), V, (d) => d.user.pinnedItems.nodes.map((n) => n.name), []),
+  contributedTo: await gqlOpt("contributed-to count", userPart("repositoriesContributedTo(contributionTypes:[COMMIT,PULL_REQUEST,ISSUE]){totalCount}"), V, (d) => d.user.repositoriesContributedTo.totalCount, 0),
+  prs: await gqlOpt("pull request counts", userPart("pullRequests{totalCount} merged: pullRequests(states:MERGED){totalCount}"), V, (d) => [d.user.pullRequests.totalCount, d.user.merged.totalCount], [0, 0]),
+  issues: await gqlOpt("issue count", userPart("issues{totalCount}"), V, (d) => d.user.issues.totalCount, 0),
+};
+if (!extra.orgs) {
+  const o = await rest(`/users/${USER}/orgs`);
+  extra.orgs = (o || []).map((x) => ({ login: x.login, avatarUrl: x.avatar_url, url: `https://github.com/${x.login}` }));
+}
+
+const cc = await gqlOpt("contributions", userPart(`contributionsCollection{
+    contributionYears
+    totalCommitContributions totalIssueContributions totalPullRequestContributions
+    totalPullRequestReviewContributions totalRepositoryContributions restrictedContributionsCount
+    contributionCalendar{ totalContributions weeks{ contributionDays{ date contributionCount } } }
+  }`), V, (d) => d.user.contributionsCollection, {
+  contributionYears: [], totalCommitContributions: 0, totalIssueContributions: 0, totalPullRequestContributions: 0,
+  totalPullRequestReviewContributions: 0, totalRepositoryContributions: 0, restrictedContributionsCount: 0,
+  contributionCalendar: { totalContributions: 0, weeks: [] },
+});
 const years = cc.contributionYears || [];
 const yearly = [];
 for (const y of years) {
-  const d = await gql(
+  const c = await gqlOpt(`contributions ${y}`,
     `query($login:String!,$from:DateTime!,$to:DateTime!){user(login:$login){contributionsCollection(from:$from,to:$to){
       contributionCalendar{totalContributions} totalCommitContributions totalPullRequestContributions totalIssueContributions totalRepositoryContributions}}}`,
-    { login: USER, from: `${y}-01-01T00:00:00Z`, to: `${y}-12-31T23:59:59Z` }
-  );
-  const c = d.user.contributionsCollection;
+    { login: USER, from: `${y}-01-01T00:00:00Z`, to: `${y}-12-31T23:59:59Z` }, (d) => d.user.contributionsCollection, null);
+  if (!c) continue;
   yearly.push({
     year: y,
     total: c.contributionCalendar.totalContributions,
@@ -133,43 +199,55 @@ for (const y of years) {
 yearly.sort((a, b) => a.year - b.year);
 
 // ───────────────────────── 2. repositories ─────────────────────────
-const repoQ = `
-query($login:String!,$after:String,$privacy:RepositoryPrivacy){
-  user(login:$login){
-    repositories(first:50,after:$after,privacy:$privacy,ownerAffiliations:[${EXTRA_OWNERS}],orderBy:{field:STARGAZERS,direction:DESC}){
-      pageInfo{hasNextPage endCursor}
-      nodes{
+// Fields that some tokens may not be allowed to read are kept separate, so the
+// query can fall back to the core set instead of failing outright.
+const REPO_CORE = `
         name nameWithOwner owner{login} description url homepageUrl
-        isFork isArchived isPrivate isTemplate isMirror isDisabled
+        isFork isArchived isPrivate isTemplate isMirror
         stargazerCount forkCount diskUsage
         watchers{totalCount}
+        primaryLanguage{name color}
+        languages(first:15,orderBy:{field:SIZE,direction:DESC}){totalSize edges{size node{name color}}}
+        repositoryTopics(first:20){nodes{topic{name}}}
+        licenseInfo{spdxId name}
+        createdAt updatedAt pushedAt
+        releases{totalCount}
+        latestRelease{tagName name publishedAt url}
+        parent{nameWithOwner url}
+        defaultBranchRef{name target{... on Commit{history{totalCount} committedDate}}}`;
+const REPO_EXTRA = `
+        archivedAt
         openIssues: issues(states:OPEN){totalCount}
         closedIssues: issues(states:CLOSED){totalCount}
         openPRs: pullRequests(states:OPEN){totalCount}
         mergedPRs: pullRequests(states:MERGED){totalCount}
         closedPRs: pullRequests(states:CLOSED){totalCount}
-        primaryLanguage{name color}
-        languages(first:15,orderBy:{field:SIZE,direction:DESC}){totalSize edges{size node{name color}}}
-        repositoryTopics(first:20){nodes{topic{name}}}
-        licenseInfo{spdxId name}
-        createdAt updatedAt pushedAt archivedAt
-        releases{totalCount}
-        latestRelease{tagName name publishedAt url}
         tags: refs(refPrefix:"refs/tags/"){totalCount}
         branches: refs(refPrefix:"refs/heads/"){totalCount}
         discussions{totalCount}
-        deployments{totalCount}
-        parent{nameWithOwner url}
-        defaultBranchRef{name target{... on Commit{history{totalCount} committedDate}}}
-      }
+        deployments{totalCount}`;
+const repoQ = (fields) => `
+query($login:String!,$after:String,$privacy:RepositoryPrivacy){
+  user(login:$login){
+    repositories(first:50,after:$after,privacy:$privacy,ownerAffiliations:[${EXTRA_OWNERS}],orderBy:{field:STARGAZERS,direction:DESC}){
+      pageInfo{hasNextPage endCursor}
+      nodes{${fields}}
     }
   }
 }`;
 const repos = [];
-let after = null;
+let after = null, fields = REPO_CORE + REPO_EXTRA;
 do {
-  const d = await gql(repoQ, { login: USER, after, privacy: INCLUDE_PRIVATE ? null : "PUBLIC" });
-  const r = d.user.repositories;
+  const vars = { login: USER, after, privacy: INCLUDE_PRIVATE ? null : "PUBLIC" };
+  let { data, errors } = await gqlTry(repoQ(fields), vars);
+  if (!data?.user?.repositories && fields !== REPO_CORE) {
+    console.warn(`! Full repository query refused (${errText(errors || [])}); retrying with core fields`);
+    fields = REPO_CORE;
+    ({ data, errors } = await gqlTry(repoQ(fields), vars));
+  }
+  const r = data?.user?.repositories;
+  if (!r) die(`Could not list repositories: ${errText(errors || [])}`);
+  if (errors?.length) console.warn("! GraphQL warning:", errText(errors));
   repos.push(...r.nodes.filter(Boolean));
   after = r.pageInfo.hasNextPage ? r.pageInfo.endCursor : null;
   log(`repos: ${repos.length}`);
@@ -209,7 +287,7 @@ const enriched = await pool(kept, 4, async (r) => {
   // Release asset downloads
   let downloads = 0;
   const releaseList = [];
-  if (r.releases.totalCount > 0) {
+  if (cnt(r.releases) > 0) {
     for (let page = 1; page <= 10; page++) {
       const rel = await rest(`/repos/${full}/releases?per_page=100&page=${page}`);
       if (!rel || !rel.length) break;
@@ -240,27 +318,27 @@ const enriched = await pool(kept, 4, async (r) => {
   // Weekly commit activity for the last year (REST stats; may be empty on first request)
   const participation = await rest(`/repos/${full}/stats/participation`);
 
-  const totalLang = r.languages.totalSize || 0;
+  const totalLang = r.languages?.totalSize || 0;
   return {
     name, full, owner, description: r.description, url: r.url, homepage: r.homepageUrl || null,
     fork: r.isFork, archived: r.isArchived, private: r.isPrivate, template: r.isTemplate, mirror: r.isMirror,
     parent: r.parent?.nameWithOwner || null,
-    stars: r.stargazerCount, forks: r.forkCount, watchers: r.watchers.totalCount,
-    issuesOpen: r.openIssues.totalCount, issuesClosed: r.closedIssues.totalCount,
-    prsOpen: r.openPRs.totalCount, prsMerged: r.mergedPRs.totalCount, prsClosed: r.closedPRs.totalCount,
+    stars: r.stargazerCount, forks: r.forkCount, watchers: cnt(r.watchers),
+    issuesOpen: cnt(r.openIssues), issuesClosed: cnt(r.closedIssues),
+    prsOpen: cnt(r.openPRs), prsMerged: cnt(r.mergedPRs), prsClosed: cnt(r.closedPRs),
     sizeKB: r.diskUsage || 0,
     language: r.primaryLanguage?.name || null, languageColor: r.primaryLanguage?.color || null,
-    languages: r.languages.edges.map((e) => ({ name: e.node.name, color: e.node.color, bytes: e.size, pct: totalLang ? +(100 * e.size / totalLang).toFixed(2) : 0 })),
-    topics: r.repositoryTopics.nodes.map((n) => n.topic.name),
+    languages: (r.languages?.edges || []).map((e) => ({ name: e.node.name, color: e.node.color, bytes: e.size, pct: totalLang ? +(100 * e.size / totalLang).toFixed(2) : 0 })),
+    topics: (r.repositoryTopics?.nodes || []).map((n) => n.topic.name),
     license: r.licenseInfo?.spdxId && r.licenseInfo.spdxId !== "NOASSERTION" ? r.licenseInfo.spdxId : (r.licenseInfo?.name || null),
-    created: r.createdAt, updated: r.updatedAt, pushed: r.pushedAt, archivedAt: r.archivedAt,
+    created: r.createdAt, updated: r.updatedAt, pushed: r.pushedAt, archivedAt: r.archivedAt || null,
     commits: r.defaultBranchRef?.target?.history?.totalCount ?? 0,
     lastCommit: r.defaultBranchRef?.target?.committedDate || null,
     defaultBranch: r.defaultBranchRef?.name || null,
-    branches: r.branches.totalCount, tags: r.tags.totalCount,
-    releases: r.releases.totalCount, latestRelease: r.latestRelease ? { tag: r.latestRelease.tagName, date: r.latestRelease.publishedAt, url: r.latestRelease.url } : null,
+    branches: cnt(r.branches), tags: cnt(r.tags),
+    releases: cnt(r.releases), latestRelease: r.latestRelease ? { tag: r.latestRelease.tagName, date: r.latestRelease.publishedAt, url: r.latestRelease.url } : null,
     releaseList: releaseList.slice(0, 30), downloads,
-    discussions: r.discussions.totalCount, deployments: r.deployments.totalCount,
+    discussions: cnt(r.discussions), deployments: cnt(r.deployments),
     starDays,
     weeklyCommits: participation?.owner || null,
     _traffic: traffic,
@@ -335,12 +413,12 @@ const stats = {
     location: user.location, website: user.websiteUrl, twitter: user.twitterUsername, url: user.url,
     created: user.createdAt,
     followers: user.followers.totalCount, following: user.following.totalCount,
-    starred: user.starredRepositories.totalCount, gists: user.gists.totalCount,
-    orgs: user.organizations.nodes,
-    pinned: user.pinnedItems.nodes.map((n) => n.name),
-    contributedTo: user.repositoriesContributedTo.totalCount,
-    prsAuthored: user.pullRequests.totalCount, prsAuthoredMerged: user.mergedPRs.totalCount,
-    issuesAuthored: user.issues.totalCount,
+    starred: extra.starred, gists: extra.gists,
+    orgs: extra.orgs,
+    pinned: extra.pinned,
+    contributedTo: extra.contributedTo,
+    prsAuthored: extra.prs[0], prsAuthoredMerged: extra.prs[1],
+    issuesAuthored: extra.issues,
   },
   contributions: {
     lastYear: {
